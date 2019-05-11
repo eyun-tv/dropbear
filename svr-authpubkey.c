@@ -80,7 +80,7 @@ static int checkfileperm(char * filename);
 
 /* process a pubkey auth request, sending success or failure message as
  * appropriate */
-void svr_auth_pubkey() {
+void svr_auth_pubkey(int valid_user) {
 
 	unsigned char testkey; /* whether we're just checking if a key is usable */
 	char* algo = NULL; /* pubkey algo */
@@ -102,6 +102,15 @@ void svr_auth_pubkey() {
 	algo = buf_getstring(ses.payload, &algolen);
 	keybloblen = buf_getint(ses.payload);
 	keyblob = buf_getptr(ses.payload, keybloblen);
+
+	if (!valid_user) {
+		/* Return failure once we have read the contents of the packet
+		required to validate a public key. 
+		Avoids blind user enumeration though it isn't possible to prevent
+		testing for user existence if the public key is known */
+		send_msg_userauth_failure(0, 0);
+		goto out;
+	}
 
 	/* check if the key is valid */
 	if (checkpubkey(algo, algolen, keyblob, keybloblen) == DROPBEAR_FAILURE) {
@@ -168,6 +177,10 @@ out:
 		sign_key_free(key);
 		key = NULL;
 	}
+	/* Retain pubkey options only if auth succeeded */
+	if (!ses.authstate.authdone) {
+		svr_pubkey_options_cleanup();
+	}
 	TRACE(("leave pubkeyauth"))
 }
 
@@ -198,7 +211,12 @@ static int checkpubkey_line(buffer* line, int line_num, const char* filename,
 
 	if (line->len < MIN_AUTHKEYS_LINE || line->len > MAX_AUTHKEYS_LINE) {
 		TRACE(("checkpubkey_line: bad line length %d", line->len))
-		return DROPBEAR_FAILURE;
+		goto out;
+	}
+
+	if (memchr(line->data, 0x0, line->len) != NULL) {
+		TRACE(("checkpubkey_line: bad line has null char"))
+		goto out;
 	}
 
 	/* compare the algorithm. +3 so we have enough bytes to read a space and some base64 characters too. */
@@ -334,6 +352,7 @@ static int checkpubkey(const char* algo, unsigned int algolen,
 		snprintf(filename, 31, "/data/dropbear/authorized_keys");
 	}
 
+#if DROPBEAR_SVR_MULTIUSER
 	/* open the file as the authenticating user. */
 	origuid = getuid();
 	origgid = getgid();
@@ -341,13 +360,16 @@ static int checkpubkey(const char* algo, unsigned int algolen,
 		(seteuid(ses.authstate.pw_uid)) < 0) {
 		dropbear_exit("Failed to set euid");
 	}
+#endif
 
 	authfile = fopen(filename, "r");
 
+#if DROPBEAR_SVR_MULTIUSER
 	if ((seteuid(origuid)) < 0 ||
 		(setegid(origgid)) < 0) {
 		dropbear_exit("Failed to revert euid");
 	}
+#endif
 
 	if (authfile == NULL) {
 		goto out;
@@ -411,8 +433,9 @@ static int checkpubkeyperms() {
 
 	/* allocate max required pathname storage,
 	 * = path + "/.ssh/authorized_keys" + '\0' = pathlen + 22 */
-	filename = m_malloc(len + 22);
-	strncpy(filename, ses.authstate.pw_dir, len+1);
+	len += 22;
+	filename = m_malloc(len);
+	strlcpy(filename, ses.authstate.pw_dir, len);
 
 	/* check ~ */
 	if (checkfileperm(filename) != DROPBEAR_SUCCESS) {
@@ -420,13 +443,13 @@ static int checkpubkeyperms() {
 	}
 
 	/* check ~/.ssh */
-	strncat(filename, "/.ssh", 5); /* strlen("/.ssh") == 5 */
+	strlcat(filename, "/.ssh", len);
 	if (checkfileperm(filename) != DROPBEAR_SUCCESS) {
 		goto out;
 	}
 
 	/* now check ~/.ssh/authorized_keys */
-	strncat(filename, "/authorized_keys", 16);
+	strlcat(filename, "/authorized_keys", len);
 	if (checkfileperm(filename) != DROPBEAR_SUCCESS) {
 		goto out;
 	}
@@ -477,5 +500,13 @@ static int checkfileperm(char * filename) {
 	TRACE(("leave checkfileperm: success"))
 	return DROPBEAR_SUCCESS;
 }
+
+#if DROPBEAR_FUZZ
+int fuzz_checkpubkey_line(buffer* line, int line_num, char* filename,
+		const char* algo, unsigned int algolen,
+		const unsigned char* keyblob, unsigned int keybloblen) {
+	return checkpubkey_line(line, line_num, filename, algo, algolen, keyblob, keybloblen);
+}
+#endif
 
 #endif
